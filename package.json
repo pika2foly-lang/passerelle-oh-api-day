@@ -1,0 +1,15 @@
+{
+  "name": "passerelle-oh-api-day",
+  "version": "3.1.0",
+  "description": "Worker Cloudflare personnel Oh API Day — IA + Galaxy + activation extension + proxy web + co-navigation",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "license": "MIT",
+  "private": false
+}

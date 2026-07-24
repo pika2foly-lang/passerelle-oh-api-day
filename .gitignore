@@ -1,0 +1,8 @@
+node_modules/
+.dev.vars
+.wrangler/
+*.log
+.DS_Store
+.env
+.vscode/
+.idea/

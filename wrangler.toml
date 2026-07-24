@@ -1,0 +1,20 @@
+name = "passerelle-oh-api-day"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["0 4 * * *"]
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "GALAXY"
+id = "galaxy_placeholder"
+
+[[kv_namespaces]]
+binding = "CONAV_SESSIONS"
+id = "conav_placeholder"

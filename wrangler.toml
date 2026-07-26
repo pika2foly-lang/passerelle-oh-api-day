@@ -13,8 +13,8 @@ binding = "AI"
 
 [[kv_namespaces]]
 binding = "GALAXY"
-id = "galaxy_placeholder"
+id = "48c92c470f0d40b29549bd0ac55caf2d"
 
 [[kv_namespaces]]
 binding = "CONAV_SESSIONS"
-id = "conav_placeholder"
+id = "8ef839c34df047a59cc6bbd9e1416c66"

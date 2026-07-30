@@ -2416,9 +2416,6 @@ Pour modifier : <a href="https://dash.cloudflare.com" target="_blank">dash.cloud
 </body></html>`;
 }
 
-const CONAV_TTL_SECONDS = 3600;
-const CONAV_MAX_EVENTS = 200;
-const CONAV_CODE_LENGTH = 6;
 
 function jsonResponse(obj, status) {
   return new Response(JSON.stringify(obj), {

@@ -6,7 +6,7 @@ Une seule installation, tout est débloqué.
 
 ---
 
-## 🎯 À quoi sert ce serveur ?
+##  🎯 À quoi sert ce serveur ?
 
 Oh API Day est une application qui rend le web accessible et intelligent grâce à l'IA. Elle a besoin d'un petit serveur pour :
 

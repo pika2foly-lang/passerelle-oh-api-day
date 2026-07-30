@@ -2382,4 +2382,1586 @@ function buildBridgeScript(proxyOrigin, targetRoot) {
 }
 
 function homePage(origin) {
-  return `<
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Passerelle Oh API Day</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:0 24px;color:#1F1135;line-height:1.6}
+h1{color:#8B1A1A;font-size:28px;margin:0 0 6px}
+.sub{color:#8B5A0B;font-weight:600;margin-bottom:24px}
+code{background:#F5E6D3;padding:2px 8px;border-radius:6px;font-family:'Courier New',monospace;font-size:13px;word-break:break-all}
+.ok{padding:14px 16px;background:#10b98115;border:1px solid #10b98140;border-radius:10px;color:#065f46;margin:18px 0}
+a{color:#8B1A1A;font-weight:600}
+</style></head>
+<body>
+<h1>🌉 Passerelle Web Active</h1>
+<div class="sub">Worker Cloudflare déployé pour Oh API Day</div>
+<div class="ok">✅ Tout fonctionne ! Tu peux maintenant utiliser cette URL dans Astrid Navig.</div>
+<h3>URL à copier dans Astrid :</h3>
+<code>${origin}</code>
+<h3>Routes disponibles :</h3>
+<ul>
+  <li><code>${origin}/proxy-web?url=&lt;site&gt;</code> — proxifier une page</li>
+  <li><code>${origin}/proxy-asset?url=&lt;asset&gt;</code> — proxifier un asset</li>
+</ul>
+<h3>Fonctionnalités du bridge :</h3>
+<ul>
+  <li>✓ X-Frame-Options stripped</li>
+  <li>✓ Liens internes routés via proxy</li>
+  <li>✓ Astrid peut pointer DANS la page (cercle orange + label)</li>
+  <li>✓ Astrid peut lire les éléments interactifs de la page</li>
+</ul>
+<p style="margin-top:36px;color:#5a4030;font-size:13px">
+Pour modifier : <a href="https://dash.cloudflare.com" target="_blank">dash.cloudflare.com</a>
+</p>
+</body></html>`;
+}
+
+const CONAV_TTL_SECONDS = 3600;
+const CONAV_MAX_EVENTS = 200;
+const CONAV_CODE_LENGTH = 6;
+
+function jsonResponse(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+  });
+}
+async function rateLimitByIP(env, ip, action, max, windowSec) {
+  if (!env || !env.RATELIMIT || !ip) return false;
+  const key = 'rl:' + action + ':' + ip;
+  const cur = await env.RATELIMIT.get(key);
+  const count = parseInt(cur, 10) || 0;
+  if (count >= max) return true;
+  await env.RATELIMIT.put(key, String(count + 1), { expirationTtl: windowSec });
+  return false;
+}
+const HB_AGREGAT_CLE = 'hb:stats:daily:latest';
+
+// Lit UNE cle au lieu de parcourir tout le prefixe.
+// 1 lecture KV par visite au lieu de 1001.
+
+// Parcourt les compteurs bruts et ecrit UN agregat consultable.
+// Appelee par le cron (1x/jour) ou au premier appel apres deploiement.
+async function reconstruireAgregatHeartbeat(env) {
+  if (!env || !env.CONAV_SESSIONS) return {};
+  const stats = {};
+  let curseur = undefined;
+
+  do {
+    const lot = await env.CONAV_SESSIONS.list({ prefix: 'hb:20', limit: 1000, cursor: curseur });
+    for (const k of lot.keys) {
+      const parts = k.name.split(':');          // hb:AAAA-MM-JJ:evenement:issue
+      if (parts.length !== 4) continue;
+      const v = await env.CONAV_SESSIONS.get(k.name);
+      if (!v) continue;
+      const [, jour, evenement, issue] = parts;
+      stats[jour] = stats[jour] || {};
+      stats[jour][evenement] = stats[jour][evenement] ||
+        { ok: 0, fail: 0, na: 0, durationAvgMs: null, topDomains: {} };
+      try {
+        const agg = JSON.parse(v);
+        stats[jour][evenement][issue] = agg.count;
+        if (agg.durationCount > 0) {
+          stats[jour][evenement].durationAvgMs = Math.round(agg.durationSum / agg.durationCount);
+        }
+        for (const [d, c] of Object.entries(agg.domains || {})) {
+          stats[jour][evenement].topDomains[d] = (stats[jour][evenement].topDomains[d] || 0) + c;
+        }
+      } catch (e) {}
+    }
+    curseur = lot.list_complete ? undefined : lot.cursor;
+  } while (curseur);
+
+  try {
+    await env.CONAV_SESSIONS.put(
+      HB_AGREGAT_CLE,
+      JSON.stringify({ stats: stats, generated: new Date().toISOString() }),
+      { expirationTtl: 8 * 86400 }
+    );
+  } catch (e) { /* l'agregat est un confort, jamais bloquant */ }
+
+  return stats;
+}
+
+
+
+// ════════════════════════════════════════════════════════════════
+// MODULES CLIENT (lot 1) — injectés dans la page via buildFullBridge
+// Chacun est un <script> isolé. Pour désactiver l'un d'eux, retire sa
+// ligne dans buildFullBridge ci-dessus.
+// ════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════
+// 05 — FORMULAIRES + FETCH (client, injecté)  [LE VRAI CORRECTIF]
+// ════════════════════════════════════════════════════════════════
+//
+// Corrige : recherche, connexion, démarches -> le submit sortait du
+// proxy et échouait. On l'intercepte et on le renvoie DANS le proxy.
+//
+// Détail important : un formulaire GET ajoute ses champs à la fin de
+// l'URL d'action. Si on réécrivait l'action côté HTML, les champs se
+// colleraient au mauvais endroit. On construit donc la vraie URL cible
+// ici, avec ses paramètres, PUIS on la proxifie. C'est la seule façon
+// correcte.
+//
+// Les formulaires SENSIBLES (mot de passe, RIB…) ne sont PAS proxifiés :
+// on émet un événement que le module sécurité (04) rattrape pour
+// proposer d'ouvrir le vrai site officiel.
+
+function featForms(cfg) {
+  const P = JSON.stringify(cfg.proxyOrigin);
+  const R = JSON.stringify(cfg.targetRoot);
+  return String.raw`(function(){
+  var PROXY = ${P}, ROOT = ${R};
+  function sameRoot(host){
+    host = String(host).toLowerCase();
+    return host === ROOT || host.slice(-(ROOT.length+1)) === '.' + ROOT;
+  }
+  function isSensitive(form){
+    if (form.querySelector('input[type=password]')) return true;
+    var risky = /rib|iban|carte|card|cvv|cvc|bancaire|paiement|mot.?de.?passe|password/i;
+    var fields = form.querySelectorAll('input, select');
+    for (var i = 0; i < fields.length; i++){
+      var meta = (fields[i].name||'') + ' ' + (fields[i].id||'') + ' ' + (fields[i].getAttribute('autocomplete')||'');
+      if (risky.test(meta)) return true;
+    }
+    return false;
+  }
+  document.addEventListener('submit', function(e){
+    var form = e.target;
+    if (!form || form.tagName !== 'FORM') return;
+    var method = (form.getAttribute('method') || 'get').toLowerCase();
+    var action;
+    try { action = new URL(form.getAttribute('action') || location.href, document.baseURI); }
+    catch(err){ return; }
+    if (action.protocol !== 'https:' && action.protocol !== 'http:') return;
+    if (!sameRoot(action.hostname)) return; // cross-domaine : on laisse le navigateur faire
+
+    if (isSensitive(form)) {
+      e.preventDefault();
+      try {
+        window.parent.postMessage({
+          source: 'ohapiday-bridge', type: 'sensitive-submit', action: action.href
+        }, '*');
+      } catch(_){}
+      // le module sécurité (04) prend le relais et propose le vrai site
+      return;
+    }
+
+    e.preventDefault();
+    var fd = new FormData(form);
+    // inclure le bouton d'envoi cliqué s'il porte un name
+    if (e.submitter && e.submitter.name) fd.append(e.submitter.name, e.submitter.value || '');
+
+    if (method === 'get') {
+      var qp = new URLSearchParams(action.search);
+      fd.forEach(function(v, k){ if (typeof v === 'string') qp.set(k, v); });
+      action.search = qp.toString();
+      window.location.href = PROXY + '/proxy-web?url=' + encodeURIComponent(action.href);
+    } else {
+      // POST : on rejoue le formulaire vers le proxy (le Worker transmet le corps)
+      var pf = document.createElement('form');
+      pf.method = 'POST';
+      pf.action = PROXY + '/proxy-web?url=' + encodeURIComponent(action.href);
+      pf.style.display = 'none';
+      fd.forEach(function(v, k){
+        if (typeof v !== 'string') return; // pas de fichiers ici
+        var inp = document.createElement('input');
+        inp.type = 'hidden'; inp.name = k; inp.value = v;
+        pf.appendChild(inp);
+      });
+      document.body.appendChild(pf);
+      pf.submit();
+    }
+  }, true);
+
+  // ---- fetch() de la page : re-router les appels internes via le proxy ----
+  // Utile pour les sites dynamiques dont l'API est bloquée par CORS :
+  // le proxy, lui, fetch côté serveur et contourne CORS.
+  // (Module le plus "sensible" : si un site complexe se comporte mal,
+  //  c'est le premier à désactiver — commente ce bloc.)
+  try {
+    var _fetch = window.fetch;
+    if (typeof _fetch === 'function') {
+      window.fetch = function(input, init){
+        try {
+          var url = (typeof input === 'string') ? input : (input && input.url);
+          if (url) {
+            var u = new URL(url, document.baseURI);
+            if ((u.protocol === 'https:' || u.protocol === 'http:') &&
+                sameRoot(u.hostname) && u.origin !== location.origin) {
+              var prox = PROXY + '/proxy-web?url=' + encodeURIComponent(u.href);
+              if (typeof input === 'string') input = prox;
+              else input = new Request(prox, input);
+            }
+          }
+        } catch(_){}
+        return _fetch.call(this, input, init);
+      };
+    }
+  } catch(_){}
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 04 — SÉCURITÉ (client, injecté) : badge officiel + garde anti-arnaque
+// ════════════════════════════════════════════════════════════════
+//
+// Deux comportements :
+//   1) Page sur un domaine OFFICIEL  -> petit badge vert rassurant.
+//   2) Page qui demande login / RIB / paiement sur un domaine NON
+//      vérifié -> bandeau : "ouvre plutôt le vrai site officiel".
+//
+// C'est TON différenciateur : au lieu d'apprendre à ton public à taper
+// son mot de passe sur un domaine proxy (réflexe d'arnaque), Astrid le
+// protège. Reçoit aussi 'sensitive-submit' émis par le module 05.
+
+function featSecurite(cfg) {
+  const OFF = JSON.stringify(cfg.officielsList || []);
+  return String.raw`(function(){
+  var OFFICIELS = ${OFF};
+  function realUrl(){
+    try { return new URLSearchParams(location.search).get('url') || document.baseURI; }
+    catch(e){ return document.baseURI; }
+  }
+  function hostOf(u){ try { return new URL(u).hostname.toLowerCase().replace(/^www\./,''); } catch(e){ return ''; } }
+  function racine(host){
+    var parts = host.split('.');
+    if (parts.length <= 2) return host;
+    var composes = ['gouv.fr','asso.fr','co.uk','com.br'];
+    var deux = parts.slice(-2).join('.');
+    if (composes.indexOf(deux) !== -1) return parts.slice(-3).join('.');
+    return deux;
+  }
+  function estOfficiel(host){
+    if (!host) return false;
+    if (host === 'gouv.fr' || /\.gouv\.fr$/.test(host)) return true;
+    if (OFFICIELS.indexOf(host) !== -1) return true;
+    return OFFICIELS.indexOf(racine(host)) !== -1;
+  }
+  var HOST = hostOf(realUrl());
+  var OFFICIEL = estOfficiel(HOST);
+
+  // --- badge officiel discret (en bas à gauche) ---
+  function badge(){
+    if (!OFFICIEL) return;
+    if (document.getElementById('__astrid_badge__')) return;
+    var b = document.createElement('div');
+    b.id = '__astrid_badge__';
+    b.textContent = '✅ Site officiel vérifié';
+    b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483646;'
+      + 'background:#065f46;color:#fff;font:600 13px system-ui,sans-serif;'
+      + 'padding:8px 12px;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,.25);'
+      + 'pointer-events:none;opacity:.96';
+    (document.body || document.documentElement).appendChild(b);
+    setTimeout(function(){ if (b.parentNode){ b.style.transition='opacity .6s'; b.style.opacity='0'; setTimeout(function(){ b.remove(); },700); } }, 6000);
+  }
+
+  // --- bandeau d'alerte + bouton "ouvrir le vrai site" ---
+  function alerte(msg){
+    if (document.getElementById('__astrid_garde__')) return;
+    var bar = document.createElement('div');
+    bar.id = '__astrid_garde__';
+    bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;'
+      + 'background:#8B1A1A;color:#FFE8B5;font:700 16px system-ui,sans-serif;'
+      + 'padding:16px 18px;box-shadow:0 4px 20px rgba(0,0,0,.35);'
+      + 'display:flex;align-items:center;gap:14px;flex-wrap:wrap';
+    var txt = document.createElement('span');
+    txt.style.flex = '1 1 240px';
+    txt.textContent = '⚠️ ' + msg;
+    var btn = document.createElement('button');
+    btn.textContent = 'Ouvrir le vrai site officiel';
+    btn.style.cssText = 'background:#FFE8B5;color:#8B1A1A;border:0;border-radius:10px;'
+      + 'padding:12px 18px;font:800 15px system-ui,sans-serif;cursor:pointer';
+    btn.onclick = function(){ try { window.open(realUrl(), '_blank', 'noopener'); } catch(e){} };
+    var close = document.createElement('button');
+    close.textContent = 'Fermer';
+    close.style.cssText = 'background:transparent;color:#FFE8B5;border:1px solid #FFE8B5;'
+      + 'border-radius:10px;padding:12px 14px;font:700 14px system-ui,sans-serif;cursor:pointer';
+    close.onclick = function(){ bar.remove(); };
+    bar.appendChild(txt); bar.appendChild(btn); bar.appendChild(close);
+    (document.body || document.documentElement).appendChild(bar);
+  }
+
+  // page sensible (mot de passe / RIB) sur domaine non officiel ?
+  function scanSensible(){
+    if (OFFICIEL) return; // sur un vrai site officiel, saisir est normal
+    var hasPwd = !!document.querySelector('input[type=password]');
+    var risky = document.querySelector('input[autocomplete*="cc-"], input[name*="rib" i], input[name*="iban" i], input[name*="carte" i]');
+    if (hasPwd || risky) {
+      alerte('Cette page demande une information sensible (mot de passe ou coordonnées). Par sécurité, fais-le sur le vrai site officiel.');
+    }
+  }
+
+  // signal envoyé par le module formulaires quand un envoi sensible est bloqué
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.type !== 'sensitive-submit') return;
+    alerte('Cette démarche demande ta connexion. Pour ta sécurité, termine-la sur le vrai site officiel.');
+  });
+
+  function run(){ try { badge(); scanSensible(); } catch(e){} }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+  else run();
+  setTimeout(run, 1500); // re-scan si la page se remplit après coup
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 06 — LECTURE À VOIX HAUTE (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Bouton flottant "🔊 Lire". Lit la sélection si tu as surligné du
+// texte, sinon le contenu principal de la page. Gratuit (SpeechSynthesis
+// natif), aucune dépendance. Langue configurable via cfg.lang.
+//
+// Astuce accessibilité : gros bouton, contraste fort, un seul geste.
+
+function featTTS(cfg) {
+  const LANG = JSON.stringify(cfg.lang || 'fr-FR');
+  return String.raw`(function(){
+  if (!('speechSynthesis' in window)) return;
+  var LANG = ${LANG};
+  var speaking = false;
+
+  function mainText(){
+    var sel = String(window.getSelection ? window.getSelection().toString() : '').trim();
+    if (sel.length > 1) return sel;
+    var el = document.querySelector('main, article, [role=main], #content, .content') || document.body;
+    var t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    return t.slice(0, 9000); // borne raisonnable
+  }
+  function stop(){
+    try { window.speechSynthesis.cancel(); } catch(e){}
+    speaking = false; render();
+  }
+  function speak(){
+    var text = mainText();
+    if (!text) return;
+    stop();
+    var u = new SpeechSynthesisUtterance(text);
+    u.lang = LANG; u.rate = 0.95; u.pitch = 1;
+    u.onend = function(){ speaking = false; render(); };
+    u.onerror = function(){ speaking = false; render(); };
+    speaking = true; render();
+    try { window.speechSynthesis.speak(u); } catch(e){ speaking = false; render(); }
+  }
+
+  var btn = document.createElement('button');
+  btn.id = '__astrid_tts__';
+  btn.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483646;'
+    + 'background:#1F1135;color:#FFE8B5;border:0;border-radius:14px;'
+    + 'padding:14px 18px;font:800 16px system-ui,sans-serif;cursor:pointer;'
+    + 'box-shadow:0 6px 18px rgba(0,0,0,.3);display:flex;align-items:center;gap:8px';
+  function render(){ btn.textContent = speaking ? '⏹ Arrêter la lecture' : '🔊 Lire la page'; }
+  render();
+  btn.onclick = function(){ speaking ? stop() : speak(); };
+
+  function mount(){ if (!document.getElementById('__astrid_tts__')) (document.body||document.documentElement).appendChild(btn); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
+  else mount();
+
+  // arrête la lecture si on quitte la page
+  window.addEventListener('beforeunload', stop);
+
+  // permet à ton app de piloter la lecture (ex: lire l'explication d'Astrid)
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.source !== 'ohapiday-app') return;
+    if (d.type === 'tts-speak' && d.text) {
+      stop();
+      var u = new SpeechSynthesisUtterance(String(d.text).slice(0, 4000));
+      u.lang = d.lang || LANG; u.rate = 0.95;
+      try { window.speechSynthesis.speak(u); } catch(e){}
+    }
+    if (d.type === 'tts-stop') stop();
+  });
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 07 — EXPLIQUE-MOI CE MOT (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// L'utilisateur double-clique (ou appui long sur mobile) sur un mot
+// difficile -> une bulle explique en français simple, SANS quitter la
+// page. On cherche d'abord dans le glossaire (instantané, gratuit) ;
+// si absent, on demande à ton app via postMessage 'explique-request'
+// et on attend 'explique-response'.
+//
+// SEUL branchement nécessaire côté ton app (voir le guide) :
+//   - écouter 'explique-request' {word, context}
+//   - appeler Puter/Astrid : "Explique <word> en une phrase simple,
+//     dans ce contexte : <context>"
+//   - renvoyer postMessage 'explique-response' {word, text}
+
+function featExplique(cfg) {
+  const GLO = JSON.stringify(cfg.glossaire || {});
+  return String.raw`(function(){
+  var GLOSSAIRE = ${GLO};
+  function norm(s){
+    return String(s||'').toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // enlève les accents
+      .replace(/[^a-z' ]/g,'').trim();
+  }
+  // index normalisé du glossaire pour une recherche tolérante
+  var IDX = {};
+  Object.keys(GLOSSAIRE).forEach(function(k){ IDX[norm(k)] = GLOSSAIRE[k]; });
+
+  function lookup(word){
+    var n = norm(word);
+    if (!n) return null;
+    if (IDX[n]) return IDX[n];
+    // essaie le mot au singulier grossier
+    if (n.length > 4 && IDX[n.replace(/s$/,'')]) return IDX[n.replace(/s$/,'')];
+    return null;
+  }
+  function sentenceAround(node, word){
+    try {
+      var t = (node && node.textContent) || document.body.innerText || '';
+      var i = t.toLowerCase().indexOf(String(word).toLowerCase());
+      if (i < 0) return '';
+      var start = Math.max(0, i - 120), end = Math.min(t.length, i + 120);
+      return t.slice(start, end).replace(/\s+/g,' ').trim();
+    } catch(e){ return ''; }
+  }
+
+  var bulle = null;
+  function fermer(){ if (bulle && bulle.parentNode){ bulle.remove(); } bulle = null; }
+  function afficher(word, texte, x, y){
+    fermer();
+    bulle = document.createElement('div');
+    bulle.style.cssText = 'position:fixed;z-index:2147483647;max-width:320px;'
+      + 'background:#1F1135;color:#FFE8B5;font:600 16px/1.5 system-ui,sans-serif;'
+      + 'padding:14px 16px;border-radius:14px;box-shadow:0 8px 26px rgba(0,0,0,.4)';
+    var titre = document.createElement('div');
+    titre.style.cssText = 'font-weight:800;margin-bottom:6px;color:#FF9A3D';
+    titre.textContent = '💡 ' + word;
+    var corps = document.createElement('div');
+    corps.textContent = texte;
+    var fx = document.createElement('button');
+    fx.textContent = '✕';
+    fx.style.cssText = 'position:absolute;top:6px;right:8px;background:transparent;border:0;color:#FFE8B5;font-size:18px;cursor:pointer';
+    fx.onclick = fermer;
+    bulle.appendChild(titre); bulle.appendChild(corps); bulle.appendChild(fx);
+    bulle.style.left = Math.min(x, window.innerWidth - 340) + 'px';
+    bulle.style.top  = Math.min(y + 12, window.innerHeight - 140) + 'px';
+    (document.body||document.documentElement).appendChild(bulle);
+    // lecture à voix haute de l'explication, si le module TTS est là
+    try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: word + '. ' + texte }, '*'); } catch(e){}
+  }
+
+  function traiter(word, node, x, y){
+    word = String(word||'').trim();
+    if (word.length < 2 || word.length > 40) return;
+    var hit = lookup(word);
+    if (hit) { afficher(word, hit, x, y); return; }
+    // pas dans le glossaire -> on demande à l'app
+    afficher(word, '…', x, y);
+    var ctx = sentenceAround(node, word);
+    try {
+      window.parent.postMessage({ source:'ohapiday-bridge', type:'explique-request', word: word, context: ctx }, '*');
+    } catch(e){}
+  }
+
+  // réponse de l'app
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.type !== 'explique-response' || !d.word) return;
+    if (bulle) {
+      var corps = bulle.childNodes[1];
+      if (corps) corps.textContent = String(d.text||'').slice(0, 400) || 'Désolé, pas d\'explication trouvée.';
+      try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: d.word + '. ' + (d.text||'') }, '*'); } catch(e){}
+    }
+  });
+
+  // desktop : double-clic sélectionne le mot
+  document.addEventListener('dblclick', function(e){
+    var sel = String(window.getSelection ? window.getSelection().toString() : '').trim();
+    if (sel && sel.indexOf(' ') === -1) traiter(sel, e.target, e.clientX, e.clientY);
+  });
+
+  // mobile : appui long
+  var lpTimer = null, lpXY = null;
+  document.addEventListener('touchstart', function(e){
+    var t = e.touches && e.touches[0]; if (!t) return;
+    lpXY = { x: t.clientX, y: t.clientY };
+    lpTimer = setTimeout(function(){
+      var word = '';
+      try {
+        var r = document.caretRangeFromPoint ? document.caretRangeFromPoint(lpXY.x, lpXY.y) : null;
+        if (r && r.startContainer && r.startContainer.textContent){
+          var txt = r.startContainer.textContent;
+          var off = r.startOffset;
+          var left = txt.slice(0, off).match(/[\p{L}'-]+$/u);
+          var right = txt.slice(off).match(/^[\p{L}'-]+/u);
+          word = ((left?left[0]:'') + (right?right[0]:'')).trim();
+        }
+      } catch(err){}
+      if (word) traiter(word, (r&&r.startContainer), lpXY.x, lpXY.y);
+    }, 550);
+  }, { passive: true });
+  function clearLP(){ if (lpTimer){ clearTimeout(lpTimer); lpTimer = null; } }
+  document.addEventListener('touchend', clearLP, { passive: true });
+  document.addEventListener('touchmove', clearLP, { passive: true });
+
+  // fermer la bulle en cliquant ailleurs
+  document.addEventListener('click', function(e){
+    if (bulle && !bulle.contains(e.target)) fermer();
+  }, true);
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 08 — ANTI-ABANDON (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Détecte les signaux de blocage SANS que l'utilisateur demande :
+//   - inactivité prolongée (75 s sans interaction utile)
+//   - même élément cliqué 3 fois de suite (bouton qui "ne marche pas")
+//   - scroll qui oscille (cherche sans trouver)
+// Puis émet UNE fois 'user-stuck' vers ton app (cooldown 60 s), pour
+// qu'Astrid propose son aide. Un bandeau doux s'affiche en secours si
+// ton app ne réagit pas.
+//
+// Le moment critique de ton public n'est pas quand il demande de l'aide,
+// c'est quand il n'ose pas et ferme tout. Ce module attrape ça.
+
+function featAntiAbandon(cfg) {
+  return String.raw`(function(){
+  var lastInteract = Date.now();
+  var lastEmit = 0;
+  var COOLDOWN = 60000;
+
+  function emit(raison){
+    var now = Date.now();
+    if (now - lastEmit < COOLDOWN) return;
+    lastEmit = now;
+    try {
+      window.parent.postMessage({ source:'ohapiday-bridge', type:'user-stuck', reason: raison }, '*');
+    } catch(e){}
+    secours();
+  }
+
+  // bandeau doux de secours (si l'app ne prend pas la main)
+  function secours(){
+    if (document.getElementById('__astrid_help__')) return;
+    var box = document.createElement('div');
+    box.id = '__astrid_help__';
+    box.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:80px;'
+      + 'z-index:2147483646;background:#FF6A00;color:#1F1135;font:800 16px system-ui,sans-serif;'
+      + 'padding:14px 18px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.3);'
+      + 'display:flex;align-items:center;gap:12px;max-width:90vw';
+    var t = document.createElement('span');
+    t.textContent = 'Besoin d\'un coup de main sur cette page ?';
+    var oui = document.createElement('button');
+    oui.textContent = 'Oui, montre-moi';
+    oui.style.cssText = 'background:#1F1135;color:#FFE8B5;border:0;border-radius:10px;padding:10px 14px;font:800 15px system-ui;cursor:pointer';
+    oui.onclick = function(){
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'help-requested' }, '*'); } catch(e){}
+      box.remove();
+    };
+    var non = document.createElement('button');
+    non.textContent = 'Ça va';
+    non.style.cssText = 'background:transparent;color:#1F1135;border:1px solid #1F1135;border-radius:10px;padding:10px 12px;font:700 14px system-ui;cursor:pointer';
+    non.onclick = function(){ box.remove(); };
+    box.appendChild(t); box.appendChild(oui); box.appendChild(non);
+    (document.body||document.documentElement).appendChild(box);
+    setTimeout(function(){ if (box.parentNode) box.remove(); }, 15000);
+  }
+
+  // --- inactivité ---
+  function touch(){ lastInteract = Date.now(); }
+  ['click','keydown','input','pointerdown'].forEach(function(ev){
+    document.addEventListener(ev, touch, { passive: true, capture: true });
+  });
+  setInterval(function(){
+    if (document.hidden) return; // onglet en arrière-plan : on ne compte pas
+    if (Date.now() - lastInteract > 75000) { emit('inactivite'); lastInteract = Date.now(); }
+  }, 15000);
+
+  // --- même élément cliqué 3x ---
+  var lastEl = null, repeat = 0, lastClickTs = 0;
+  document.addEventListener('click', function(e){
+    var now = Date.now();
+    if (e.target === lastEl && now - lastClickTs < 8000) repeat++;
+    else repeat = 1;
+    lastEl = e.target; lastClickTs = now;
+    if (repeat >= 3) { emit('clics-repetes'); repeat = 0; }
+  }, true);
+
+  // --- scroll qui oscille ---
+  var dirs = [], lastY = window.scrollY;
+  window.addEventListener('scroll', function(){
+    var y = window.scrollY;
+    var d = y > lastY ? 1 : (y < lastY ? -1 : 0);
+    lastY = y;
+    if (d === 0) return;
+    dirs.push({ d: d, t: Date.now() });
+    dirs = dirs.filter(function(o){ return Date.now() - o.t < 8000; });
+    var flips = 0;
+    for (var i = 1; i < dirs.length; i++) if (dirs[i].d !== dirs[i-1].d) flips++;
+    if (flips >= 6) { emit('scroll-agite'); dirs = []; }
+  }, { passive: true });
+})();`;
+}
+
+
+// ════════════════════════════════════════════════════════════════
+// MODULES CLIENT (lot 2) — injectés via buildFullBridge
+// IA : ces modules N'APPELLENT PAS l'IA. Ils émettent des demandes
+// (translate-request, explique-request, proof-analyze-request…) que
+// TON APPLICATION reçoit et traite avec Puter, puis renvoie la réponse.
+// ════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════
+// 09b — MULTILINGUE ADMIN (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Sélecteur de langue flottant. Quand une langue non-FR est choisie :
+//   - chaque bouton/lien reçoit une petite bulle "traduction (Français)"
+//     -> la personne lit dans sa langue, agit sur le vrai mot FR.
+//   - le volet lecture peut être lu dans sa langue (via TTS lang).
+// Les termes d'interface courants sont traduits par le glossaire
+// (instantané). Le texte propre à la page part à ton IA.
+//
+// BRANCHEMENT APP (facultatif, pour le texte hors glossaire) :
+//   écouter 'translate-request' {lang, texts:[...]} -> IA ->
+//   renvoyer 'translate-response' {lang, translations:[...]} (même ordre)
+
+function featMultilingue(cfg) {
+  const MULTI  = JSON.stringify(cfg.glossaireMulti || {});
+  const LANGS  = JSON.stringify(cfg.languesDispo || []);
+  const TTSMAP = JSON.stringify(cfg.langTts || {});
+  return String.raw`(function(){
+  var MULTI = ${MULTI}, LANGS = ${LANGS}, TTSMAP = ${TTSMAP};
+  var current = 'fr';
+
+  function norm(s){
+    return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim();
+  }
+  function traduireTerme(txt, lang){
+    var n = norm(txt);
+    if (MULTI[n] && MULTI[n][lang]) return MULTI[n][lang];
+    return null; // inconnu du glossaire -> IA
+  }
+
+  // éléments interactifs à étiqueter
+  function cibles(){
+    return Array.prototype.slice.call(
+      document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button], label')
+    ).filter(function(el){
+      var t = (el.innerText || el.value || '').trim();
+      return t && t.length <= 40 && el.offsetParent !== null;
+    });
+  }
+
+  function poserBulle(el, trad, orig){
+    if (el.__astridTrad) el.__astridTrad.remove();
+    var tag = document.createElement('span');
+    tag.className = '__astrid_ml__';
+    tag.dir = 'auto';
+    tag.textContent = trad + ' (' + orig + ')';
+    tag.style.cssText = 'display:inline-block;background:#1F1135;color:#FFE8B5;'
+      + 'font:600 13px system-ui,sans-serif;padding:2px 8px;border-radius:8px;'
+      + 'margin-left:6px;vertical-align:middle;white-space:nowrap';
+    el.appendChild(tag);
+    el.__astridTrad = tag;
+  }
+  function nettoyer(){
+    Array.prototype.slice.call(document.querySelectorAll('.__astrid_ml__')).forEach(function(t){ t.remove(); });
+    cibles().forEach(function(el){ el.__astridTrad = null; });
+  }
+
+  function appliquer(lang){
+    current = lang;
+    nettoyer();
+    if (lang === 'fr') return;
+    var manquants = [], refs = [];
+    cibles().forEach(function(el){
+      var orig = (el.innerText || el.value || '').trim().replace(/\s*\(.*/,'');
+      var trad = traduireTerme(orig, lang);
+      if (trad) { poserBulle(el, trad, orig); }
+      else { manquants.push(orig); refs.push(el); }
+    });
+    // le reste -> IA
+    if (manquants.length) {
+      window.__astridMLpending = { lang: lang, refs: refs };
+      try {
+        window.parent.postMessage({ source:'ohapiday-bridge', type:'translate-request', lang: lang, texts: manquants }, '*');
+      } catch(e){}
+    }
+  }
+
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.type !== 'translate-response' || !window.__astridMLpending) return;
+    if (d.lang !== window.__astridMLpending.lang) return;
+    var refs = window.__astridMLpending.refs, tr = d.translations || [];
+    refs.forEach(function(el, i){
+      var orig = (el.innerText || el.value || '').trim().replace(/\s*\(.*/,'');
+      if (tr[i]) poserBulle(el, tr[i], orig);
+    });
+    window.__astridMLpending = null;
+  });
+
+  // sélecteur de langue
+  function menu(){
+    var wrap = document.createElement('div');
+    wrap.id = '__astrid_langsel__';
+    wrap.style.cssText = 'position:fixed;right:14px;top:14px;z-index:2147483646;'
+      + 'background:#fff;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,.25);'
+      + 'padding:6px;display:flex;gap:4px;flex-wrap:wrap;max-width:70vw';
+    LANGS.forEach(function(L){
+      var b = document.createElement('button');
+      b.textContent = L.nom;
+      b.dir = 'auto';
+      b.style.cssText = 'border:0;border-radius:8px;padding:8px 10px;cursor:pointer;'
+        + 'font:700 14px system-ui,sans-serif;background:#F3EEFF;color:#1F1135';
+      b.onclick = function(){
+        Array.prototype.slice.call(wrap.children).forEach(function(x){ x.style.background='#F3EEFF'; x.style.color='#1F1135'; });
+        b.style.background = '#FF6A00'; b.style.color = '#1F1135';
+        appliquer(L.code);
+      };
+      wrap.appendChild(b);
+    });
+    (document.body||document.documentElement).appendChild(wrap);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', menu);
+  else menu();
+
+  // permet à ton app de lire le contenu dans la langue choisie
+  window.__astridLangTTS = function(){ return TTSMAP[current] || 'fr-FR'; };
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 10 — REMPLISSAGE NARRÉ (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Ta valeur n'est PAS l'autofill silencieux (angoissant : "qui a rempli
+// ça ?"). C'est le TEMPO et la CONFIANCE : un champ à la fois, à voix
+// haute, avec une pause pour vérifier, et JAMAIS de validation
+// automatique. Astrid remplit, montre, explique — la personne valide.
+//
+// L'app envoie un PLAN (les valeurs viennent de TON coffre côté app,
+// jamais stockées ici) :
+//   {source:'ohapiday-app', type:'fill-plan',
+//    steps:[ {find:'nom', value:'Dupont', say:'ton nom de famille'},
+//            {find:'email', value:'a@b.fr', say:'ton adresse mail'},
+//            {find:'#pass', value:'****', say:'ton mot de passe', secret:true} ],
+//    submitLabel:'Valider'}
+//
+// Le module remplit pas à pas, surligne, narre (sauf les champs secret),
+// puis s'ARRÊTE sur le bouton d'envoi sans cliquer. Émet 'fill-done'.
+
+function featRemplissage(cfg) {
+  return String.raw`(function(){
+  function norm(s){ return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim(); }
+
+  // trouve un champ par sélecteur CSS, label associé, placeholder, name/id
+  function trouverChamp(q){
+    if (!q) return null;
+    // 1) sélecteur CSS direct
+    try { var el = document.querySelector(q); if (el) return el; } catch(e){}
+    var n = norm(q);
+    // 2) via <label>
+    var labels = document.querySelectorAll('label');
+    for (var i=0;i<labels.length;i++){
+      if (norm(labels[i].textContent).indexOf(n) !== -1){
+        var f = labels[i].getAttribute('for');
+        if (f){ var t = document.getElementById(f); if (t) return t; }
+        var inner = labels[i].querySelector('input,select,textarea'); if (inner) return inner;
+      }
+    }
+    // 3) placeholder / aria-label / name / id
+    var champs = document.querySelectorAll('input, select, textarea');
+    for (var j=0;j<champs.length;j++){
+      var meta = norm((champs[j].placeholder||'') + ' ' + (champs[j].getAttribute('aria-label')||'') + ' ' + (champs[j].name||'') + ' ' + (champs[j].id||''));
+      if (meta.indexOf(n) !== -1) return champs[j];
+    }
+    return null;
+  }
+
+  function parler(txt){
+    try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: txt }, '*'); } catch(e){}
+  }
+  function surligner(el){
+    try {
+      window.parent.postMessage({ source:'ohapiday-bridge', type:'fill-highlight',
+        rect: el.getBoundingClientRect() && { x: el.getBoundingClientRect().left, y: el.getBoundingClientRect().top, w: el.offsetWidth, h: el.offsetHeight } }, '*');
+    } catch(e){}
+    try { el.scrollIntoView({ block:'center', behavior:'smooth' }); } catch(e){}
+    el.style.outline = '3px solid #FF6A00';
+    el.style.outlineOffset = '2px';
+    setTimeout(function(){ el.style.outline=''; }, 2600);
+  }
+  function poser(el, val){
+    var proto = el.tagName === 'SELECT' ? null : Object.getPrototypeOf(el);
+    try {
+      var setter = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+      if (setter && setter.set) setter.set.call(el, val); else el.value = val;
+    } catch(e){ el.value = val; }
+    el.dispatchEvent(new Event('input', { bubbles:true }));
+    el.dispatchEvent(new Event('change', { bubbles:true }));
+  }
+
+  function jouer(plan){
+    var steps = plan.steps || [];
+    var i = 0;
+    function suite(){
+      if (i >= steps.length){ terminer(plan); return; }
+      var s = steps[i++];
+      var el = trouverChamp(s.find);
+      if (!el){
+        // champ introuvable : on prévient et on continue
+        try { window.parent.postMessage({ source:'ohapiday-bridge', type:'fill-miss', find: s.find }, '*'); } catch(e){}
+        setTimeout(suite, 200); return;
+      }
+      surligner(el);
+      var phrase = s.secret
+        ? ('Là je saisis ' + (s.say || 'cette information') + ', que je ne dis pas à voix haute.')
+        : ('Là je mets ' + (s.say || 'cette information') + ' : ' + s.value + '. Vérifie que c\'est bon.');
+      parler(phrase);
+      setTimeout(function(){ poser(el, s.value); setTimeout(suite, 1600); }, 900);
+    }
+    suite();
+  }
+
+  function terminer(plan){
+    var btn = null;
+    if (plan.submitLabel){
+      var lbl = norm(plan.submitLabel);
+      var cand = document.querySelectorAll('button, input[type=submit], [role=button]');
+      for (var k=0;k<cand.length;k++){
+        if (norm(cand[k].innerText || cand[k].value).indexOf(lbl) !== -1){ btn = cand[k]; break; }
+      }
+    }
+    if (btn){
+      surligner(btn);
+      parler('Tout est rempli. Quand tu es prêt, clique sur le bouton en orange pour valider. Je ne valide pas à ta place.');
+    } else {
+      parler('Tout est rempli. Vérifie une dernière fois, puis valide toi-même.');
+    }
+    try { window.parent.postMessage({ source:'ohapiday-bridge', type:'fill-done' }, '*'); } catch(e){}
+  }
+
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.source !== 'ohapiday-app' || d.type !== 'fill-plan') return;
+    jouer(d);
+  });
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 11 — PARCOURS REJOUABLE (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Mémorise le CHEMIN d'une démarche réussie — jamais les données
+// sensibles, seulement l'itinéraire : "sur cette page, clic sur ce
+// bouton". La fois d'après, Astrid rejoue le chemin étape par étape.
+//
+// Robuste aux changements de mise en page : on mémorise le LIBELLÉ du
+// bouton, pas ses coordonnées. findByText le retrouve même si la page a
+// bougé.
+//
+// DEUX MODES pilotés par ton app :
+//   - ENREGISTRER : {source:'ohapiday-app', type:'journey-record', on:true}
+//        -> le bridge émet 'journey-step' {url, label, tag} à chaque clic.
+//        -> ton app accumule et stocke le parcours (petit JSON).
+//   - REJOUER : {source:'ohapiday-app', type:'replay-step', step:{label}}
+//        -> le bridge surligne l'élément + narre "clique sur X".
+//        -> quand la personne clique / la page change, ton app envoie
+//           l'étape suivante.
+
+function featParcours(cfg) {
+  return String.raw`(function(){
+  var recording = false;
+  function realUrl(){ try { return new URLSearchParams(location.search).get('url') || document.baseURI; } catch(e){ return document.baseURI; } }
+  function norm(s){ return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim(); }
+  function libelle(el){
+    var t = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim();
+    return t.replace(/\s+/g,' ').slice(0, 60);
+  }
+  function estCliquable(el){
+    while (el && el !== document.body){
+      var tag = el.tagName;
+      if (tag === 'A' || tag === 'BUTTON' || el.getAttribute('role') === 'button' ||
+          (tag === 'INPUT' && /submit|button/i.test(el.type||''))) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // ENREGISTREMENT
+  document.addEventListener('click', function(e){
+    if (!recording) return;
+    var el = estCliquable(e.target);
+    if (!el) return;
+    var lab = libelle(el);
+    if (!lab) return; // pas de libellé -> inutile à rejouer
+    try {
+      window.parent.postMessage({ source:'ohapiday-bridge', type:'journey-step',
+        url: realUrl(), label: lab, tag: el.tagName }, '*');
+    } catch(err){}
+  }, true);
+
+  // REJEU : surligner l'étape courante
+  function rejouerEtape(step){
+    var cible = null, best = -1, lab = norm(step.label);
+    var cand = document.querySelectorAll('a, button, [role=button], input[type=submit], input[type=button]');
+    for (var i=0;i<cand.length;i++){
+      if (cand[i].offsetParent === null) continue;
+      var t = norm(cand[i].innerText || cand[i].value);
+      if (!t) continue;
+      var score = (t === lab) ? 100 : (t.indexOf(lab) !== -1 || lab.indexOf(t) !== -1 ? 50 : -1);
+      if (score > best){ best = score; cible = cand[i]; }
+    }
+    if (!cible){
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'replay-miss', label: step.label }, '*'); } catch(e){}
+      return;
+    }
+    try { cible.scrollIntoView({ block:'center', behavior:'smooth' }); } catch(e){}
+    cible.style.outline = '4px solid #FF6A00';
+    cible.style.outlineOffset = '3px';
+    try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: 'Clique sur ' + step.label + '. Je te le montre en orange.' }, '*'); } catch(e){}
+    // quand la personne clique dessus, on prévient l'app (étape suivante)
+    var onClick = function(){
+      cible.style.outline = '';
+      cible.removeEventListener('click', onClick, true);
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'replay-advance', label: step.label }, '*'); } catch(e){}
+    };
+    cible.addEventListener('click', onClick, true);
+  }
+
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.source !== 'ohapiday-app') return;
+    if (d.type === 'journey-record') recording = !!d.on;
+    if (d.type === 'replay-step' && d.step) rejouerEtape(d.step);
+  });
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 12 — PREUVE AUTOMATIQUE + ÉCHÉANCES (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Astrid lit chaque page et repère TOUTE SEULE :
+//   - les échéances ("avant le 15 mars", "sous 15 jours")
+//   - les numéros de dossier / références
+//   - les pages de confirmation ("votre demande a bien été prise en compte")
+//
+// Sur une confirmation, elle propose de garder la preuve (texte propre +
+// date + URL) et de créer un rappel tiré du texte même de la page.
+// C'est le pont entre l'écran et la vie réelle — là où ton public décroche.
+//
+// ÉVÉNEMENTS émis vers ton app :
+//   'proof-found'    {kind, action, date, reference, url, capturedAt, snapshot}
+//   'deadline-found' {text, date, url}
+// BRANCHEMENT IA (facultatif, pour fiabiliser l'extraction) :
+//   'proof-analyze-request' {text} -> IA -> 'proof-analyze-response' {action,date,reference}
+// Ton app : stocke la preuve, crée le rappel (calendrier / notification).
+
+function featPreuve(cfg) {
+  return String.raw`(function(){
+  function realUrl(){ try { return new URLSearchParams(location.search).get('url') || document.baseURI; } catch(e){ return document.baseURI; } }
+  function mainText(){
+    var el = document.querySelector('main, article, [role=main], #content, .content') || document.body;
+    return (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
+  }
+
+  var MOIS = 'janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre';
+  var reEcheanceMois = new RegExp('(avant le|jusqu\'au|au plus tard le|d\'ici le)\\s+(\\d{1,2}\\s+(?:' + MOIS + ')(?:\\s+\\d{4})?)', 'i');
+  var reEcheanceNum  = /(avant le|jusqu'au|au plus tard le|d'ici le)\s+(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})/i;
+  var reDelai        = /sous\s+(\d{1,2})\s+(jours|semaines|mois)/i;
+  var reReference    = /(?:dossier|référence|reference|récépissé|recepisse|numéro|numero|n[°o])\s*:?\s*(?:n[°o]\s*)?([A-Z0-9][A-Z0-9\-\/]{3,19})/i;
+  function extraireRef(txt){ var m = reReference.exec(txt); if (!m) return null; var v = m[1].trim(); return /\d/.test(v) ? v : null; }
+  var reConfirm      = /(a bien été (?:pris|prise|enregistr)|votre demande a été|confirmation de|récépissé|recepisse|accusé de réception|accuse de reception|est confirmée|est confirmee|merci.{0,20}votre demande)/i;
+
+  function analyser(){
+    var txt = mainText();
+    if (!txt || txt.length < 40) return;
+
+    // échéances (passif : même sans confirmation)
+    var mEch = reEcheanceMois.exec(txt) || reEcheanceNum.exec(txt);
+    if (mEch){
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'deadline-found',
+        text: mEch[0], date: mEch[2], url: realUrl() }, '*'); } catch(e){}
+    } else {
+      var mDel = reDelai.exec(txt);
+      if (mDel){
+        try { window.parent.postMessage({ source:'ohapiday-bridge', type:'deadline-found',
+          text: mDel[0], date: null, url: realUrl() }, '*'); } catch(e){}
+      }
+    }
+
+    // page de confirmation -> preuve
+    if (reConfirm.test(txt)){
+      var ref = extraireRef(txt);
+      var snapshot = txt.slice(0, 600);
+      var payload = {
+        kind: 'confirmation',
+        action: (reConfirm.exec(txt)||[])[0] || 'Demande confirmée',
+        date: (mEch ? mEch[2] : null),
+        reference: ref,
+        url: realUrl(),
+        capturedAt: new Date().toISOString(),
+        snapshot: snapshot
+      };
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-found', proof: payload }, '*'); } catch(e){}
+      // fiabilisation IA (facultative)
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-analyze-request', text: snapshot }, '*'); } catch(e){}
+      banniere();
+    }
+  }
+
+  // petit bandeau proposant de garder la preuve
+  function banniere(){
+    if (document.getElementById('__astrid_preuve__')) return;
+    var box = document.createElement('div');
+    box.id = '__astrid_preuve__';
+    box.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:14px;'
+      + 'z-index:2147483646;background:#065f46;color:#fff;font:700 15px system-ui,sans-serif;'
+      + 'padding:14px 18px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.3);'
+      + 'display:flex;align-items:center;gap:12px;max-width:92vw';
+    var t = document.createElement('span');
+    t.textContent = '✅ Démarche confirmée. Astrid peut garder la preuve.';
+    var b = document.createElement('button');
+    b.textContent = 'Garder la preuve';
+    b.style.cssText = 'background:#FFE8B5;color:#065f46;border:0;border-radius:10px;padding:10px 14px;font:800 15px system-ui;cursor:pointer';
+    b.onclick = function(){
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-save-confirmed' }, '*'); } catch(e){}
+      box.remove();
+    };
+    var x = document.createElement('button');
+    x.textContent = '✕';
+    x.style.cssText = 'background:transparent;color:#fff;border:0;font-size:18px;cursor:pointer';
+    x.onclick = function(){ box.remove(); };
+    box.appendChild(t); box.appendChild(b); box.appendChild(x);
+    (document.body||document.documentElement).appendChild(box);
+  }
+
+  function run(){ try { analyser(); } catch(e){} }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+  else run();
+  setTimeout(run, 2000); // re-scan si la confirmation arrive après coup
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 15 — RELAIS VOCAL (client, injecté) — le pendant de 14 dans la page
+// ════════════════════════════════════════════════════════════════
+//
+// Reçoit les ordres du module vocal (14) et agit dans la page :
+//   'voice-point' {voiceId, label, click}  -> trouve, pointe, (clique)
+//   'nav-back'                              -> page précédente
+//   'tts-speak-page'                        -> lit le contenu principal
+//   'explique-mot' {mot}                    -> demande l'explication
+//   'voice-list-elements'                   -> renvoie les libellés cliquables
+// Et signale 'page-ready' au chargement (pour enchaîner les étapes).
+
+function featVoixRelais(cfg) {
+  return String.raw`(function(){
+  function norm(s){ return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim(); }
+  function versParent(msg){ try { window.parent.postMessage(Object.assign({ source:'ohapiday-bridge' }, msg), '*'); } catch(e){} }
+
+  // Elements que l'on peut montrer ou activer.
+  // L'ancienne version ne prenait que a/button/role=button : elle ratait
+  // les champs de formulaire, les onglets, les elements custom, et
+  // surtout tout ce qui est en position:fixed (offsetParent vaut null
+  // pour eux, alors qu'ils sont parfaitement visibles).
+  function estVisible(el){
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    if (parseFloat(cs.opacity) === 0) return false;
+    return true;
+  }
+
+  function libelleDe(el){
+    // On CUMULE toutes les sources au lieu de prendre la premiere :
+    //  - un bouton icone a innerText = "🔍" (non vide) et le vrai
+    //    libelle dans aria-label ;
+    //  - un <select> a innerText = le texte des options, et son nom
+    //    dans l'attribut name ou dans un <label for>.
+    // Prendre la premiere source non vide ratait ces deux cas.
+    var bouts = [];
+    var tag = (el.tagName || '').toLowerCase();
+
+    // Les champs de formulaire : leur propre texte n'est pas leur libelle
+    if (tag !== 'select' && tag !== 'textarea' && tag !== 'input') {
+      bouts.push(el.innerText || '');
+    }
+    ['aria-label','title','alt','name','placeholder'].forEach(function(a){
+      var v = el.getAttribute && el.getAttribute(a);
+      if (v) bouts.push(v);
+    });
+    if (el.value && tag === 'input') bouts.push(el.value);
+
+    // Un <label for="..."> qui designe cet element
+    if (el.id) {
+      try {
+        var lb = document.querySelector('label[for="' + el.id + '"]');
+        if (lb && lb.innerText) bouts.push(lb.innerText);
+      } catch(e){}
+    }
+    // Le label qui l'englobe
+    var par = el.closest && el.closest('label');
+    if (par && par.innerText) bouts.push(par.innerText);
+
+    var vus = [];
+    return bouts.map(function(b){ return String(b).replace(/\s+/g,' ').trim(); })
+                .filter(function(b){ if (!b || vus.indexOf(b) !== -1) return false; vus.push(b); return true; })
+                .join(' · ')
+                .slice(0, 200);
+  }
+
+  function cliquables(){
+    var sel = 'a[href], button, [role=button], [role=link], [role=menuitem], [role=tab],'
+            + ' input[type=submit], input[type=button], input[type=radio], input[type=checkbox],'
+            + ' input[type=text], input[type=email], input[type=tel], input[type=password],'
+            + ' input[type=number], input[type=date], input[type=search],'
+            + ' select, textarea, summary, label[for], [onclick], [tabindex]:not([tabindex="-1"])';
+    var vus = [];
+    var out = [];
+    Array.prototype.slice.call(document.querySelectorAll(sel)).forEach(function(el){
+      if (vus.indexOf(el) !== -1) return;
+      vus.push(el);
+      if (!estVisible(el)) return;
+      if (!libelleDe(el)) return;
+      out.push(el);
+    });
+    return out;
+  }
+
+  // Recherche par mots : « déclarer mes revenus » doit trouver « Déclarer ».
+  // L'ancienne version n'acceptait qu'une inclusion exacte dans un sens ou
+  // dans l'autre — elle echouait des que la phrase dictee etait plus riche
+  // que le libelle, ce qui est le cas normal a l'oral.
+  var MOTS_VIDES = ['le','la','les','un','une','des','de','du','sur','au','aux',
+                    'mon','ma','mes','ton','ta','tes','ce','cet','cette','et',
+                    'bouton','lien','case','champ','onglet','clique','cliquer',
+                    'montre','montrer','appuie','appuyer','va','aller'];
+
+  function motsUtiles(t){
+    return norm(t).split(' ').filter(function(m){
+      return m.length > 2 && MOTS_VIDES.indexOf(m) === -1;
+    });
+  }
+
+  function trouver(label){
+    var lab = norm(label);
+    if (!lab) return null;
+    var motsDits = motsUtiles(label);
+    var best = -1, cible = null;
+
+    cliquables().forEach(function(el){
+      var brut = libelleDe(el);
+      var t = norm(brut);
+      if (!t) return;
+
+      var score = -1;
+      if (t === lab)                       score = 100;   // identique
+      else if (t.indexOf(lab) !== -1)      score = 85;    // le libelle contient la phrase
+      else if (lab.indexOf(t) !== -1 && t.length > 2) score = 75;  // la phrase contient le libelle
+      else if (motsDits.length) {
+        // combien des mots dits se retrouvent dans le libelle ?
+        var motsEl = motsUtiles(brut);
+        var communs = 0;
+        motsDits.forEach(function(m){
+          for (var i = 0; i < motsEl.length; i++){
+            if (motsEl[i] === m || motsEl[i].indexOf(m) === 0 || m.indexOf(motsEl[i]) === 0){ communs++; break; }
+          }
+        });
+        if (communs) score = Math.round(40 + 30 * (communs / motsDits.length));
+      }
+      if (score < 0) return;
+
+      // A egalite, on prefere ce qui est deja a l'ecran
+      var r = el.getBoundingClientRect();
+      if (r.top >= 0 && r.bottom <= window.innerHeight) score += 3;
+
+      if (score > best){ best = score; cible = el; }
+    });
+
+    return best >= 55 ? cible : null;
+  }
+
+  function pointer(el, cliquer){
+    try { el.scrollIntoView({ block:'center', behavior:'smooth' }); } catch(e){}
+    el.style.outline = '4px solid #FF6A00';
+    el.style.outlineOffset = '3px';
+    el.style.transition = 'outline-color .3s';
+    var n = 0, iv = setInterval(function(){ el.style.outlineColor = (n++ % 2) ? '#FF6A00' : '#FFD08A'; if (n > 6){ clearInterval(iv); } }, 300);
+    setTimeout(function(){ el.style.outline = ''; }, 2600);
+    if (cliquer){ setTimeout(function(){ try { el.click(); } catch(e){} }, 900); }
+  }
+
+  var __resolvePending = {};
+  function labelsCliquables(){
+    // libelleDe() cumule texte, aria-label, title, name, placeholder et
+    // <label for>. innerText seul ratait tous les boutons-icones et les
+    // champs de formulaire : l'IA ne voyait qu'une partie de la page.
+    return cliquables().map(function(el){ return libelleDe(el).slice(0, 50); })
+      .filter(Boolean).slice(0, 60);
+  }
+
+  function imagesCliquables(){
+    var out = [];
+    var imgs = document.querySelectorAll('img[src]');
+    for (var i = 0; i < imgs.length && out.length < 6; i++){
+      var img = imgs[i];
+      var r = img.getBoundingClientRect();
+      if (r.width < 20 || r.height < 12) continue;           // ignore pixels/icônes minuscules
+      var src = img.currentSrc || img.src || '';
+      if (!src || src.indexOf('data:') === 0) continue;       // pas les data-URI (souvent illisibles)
+      var clic = img.closest('a, button, [role="button"], [onclick]');
+      var cs = window.getComputedStyle(img);
+      if (!clic && cs.cursor !== 'pointer') continue;         // seulement si cliquable
+      var cible = clic || img;
+      var id = 'ocrimg-' + Date.now().toString(36) + '-' + out.length;
+      cible.setAttribute('data-nav-id', id);
+      out.push({ id: id, src: src });
+    }
+    return out;
+  }
+
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.source !== 'ohapiday-app') return;
+
+    if (d.type === 'voice-point'){
+      var el = trouver(d.label);
+      if (el){
+        pointer(el, !!d.click, d.label);
+        versParent({ type:'voice-found', voiceId:d.voiceId });
+      } else {
+        // ÉTAPE 2 — findByText a échoué : on demande à l'IA de l'app de
+        // relier ce que la personne a dit au vrai libellé d'un bouton.
+        // (ex: "valider ma commande" -> "Finaliser l'achat")
+        __resolvePending[d.voiceId] = { click: !!d.click, label: d.label };
+        versParent({
+          type: 'voice-resolve-request',
+          voiceId: d.voiceId,
+          label: d.label,
+          elements: labelsCliquables()
+        });
+      }
+    }
+    else if (d.type === 'voice-resolve-response'){
+      var pend = __resolvePending[d.voiceId];
+      var cible = d.cible ? trouver(d.cible) : null;
+      if (cible){
+        delete __resolvePending[d.voiceId];
+        pointer(cible, pend ? pend.click : false, d.cible);
+        versParent({ type:'voice-found', voiceId:d.voiceId, resolvedBy:'ia' });
+      } else {
+        // ÉTAPE 3 — OCR : le libellé est peut-être écrit DANS une image
+        // (bouton-image sans texte HTML). On envoie à l'app les images
+        // cliquables ; elle les lit avec puter.ai.img2txt et nous dit
+        // laquelle correspond.
+        var imgs = imagesCliquables();
+        if (imgs.length){
+          versParent({
+            type: 'voice-ocr-request',
+            voiceId: d.voiceId,
+            label: pend ? pend.label : d.cible,
+            images: imgs
+          });
+        } else {
+          delete __resolvePending[d.voiceId];
+          versParent({ type:'voice-miss', voiceId:d.voiceId });
+        }
+      }
+    }
+    else if (d.type === 'voice-ocr-response'){
+      var pend2 = __resolvePending[d.voiceId];
+      delete __resolvePending[d.voiceId];
+      var el2 = d.id ? document.querySelector('[data-nav-id="' + d.id + '"]') : null;
+      if (el2){
+        pointer(el2, pend2 ? pend2.click : false, pend2 ? pend2.label : '');
+        versParent({ type:'voice-found', voiceId:d.voiceId, resolvedBy:'ocr' });
+      } else {
+        versParent({ type:'voice-miss', voiceId:d.voiceId });
+      }
+    }
+    else if (d.type === 'nav-back'){ try { history.back(); } catch(e){} }
+    else if (d.type === 'tts-speak-page'){
+      var main = document.querySelector('main, article, [role=main], #content, .content') || document.body;
+      var txt = (main.innerText || '').replace(/\s+/g,' ').trim().slice(0, 9000);
+      try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: txt }, '*'); } catch(e){}
+    }
+    else if (d.type === 'explique-mot'){
+      versParent({ type:'explique-request', word: d.mot, context: '' });
+    }
+    else if (d.type === 'voice-list-elements'){
+      var labels = cliquables().map(function(el){ return (el.innerText || el.value || '').trim().slice(0, 50); })
+        .filter(Boolean).slice(0, 60);
+      versParent({ type:'voice-elements', elements: labels });
+    }
+  });
+
+  // signale que la page est prête (pour enchaîner "va sur X puis...")
+  function pret(){ versParent({ type:'page-ready', url: (function(){ try { return new URLSearchParams(location.search).get('url') || location.href; } catch(e){ return location.href; } })() }); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', pret);
+  else pret();
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  CO-NAVIGATION
+// ════════════════════════════════════════════════════════════════════════
+function genCode() {
+  let c = '';
+  for (let i = 0; i < CONAV_CODE_LENGTH; i++) c += Math.floor(Math.random() * 10);
+  return c;
+}
+function genToken() {
+  return Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+}
+async function loadSession(env, code) {
+  const raw = await env.CONAV_SESSIONS.get('s:' + code);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+async function saveSession(env, s) {
+  s.lastActivity = Date.now();
+  await env.CONAV_SESSIONS.put('s:' + s.code, JSON.stringify(s), { expirationTtl: CONAV_TTL_SECONDS });
+}
+async function hmacSha256(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Fallback sur le secret par défaut : la PWA actuelle l'utilise en dur
+async function verifyClientToken(request, env) {
+  const auth = request.headers.get('X-Astrid-Auth');
+  if (!auth) return { ok: false, reason: 'Token manquant' };
+  const parts = auth.split('.');
+  if (parts.length !== 2) return { ok: false, reason: 'Format invalide' };
+  const ts = parseInt(parts[0], 10);
+  if (isNaN(ts)) return { ok: false, reason: 'Timestamp invalide' };
+  const now = Date.now();
+  if (now - ts > 5 * 60 * 1000) return { ok: false, reason: 'Token expiré' };
+  if (ts - now > 60 * 1000) return { ok: false, reason: 'Token futur' };
+  const secret = env.ASTRID_SHARED_SECRET || DEFAULT_SHARED_SECRET;
+  const expected = await hmacSha256(secret, parts[0]);
+  if (parts[1] !== expected) return { ok: false, reason: 'Signature invalide' };
+  return { ok: true };
+}
+
+async function conavCreate(env, request) {
+  const auth = await verifyClientToken(request, env);
+  if (!auth.ok) return json({ ok: false, error: 'Auth requise : ' + auth.reason }, 401);
+  let code = null;
+  for (let i = 0; i < 5; i++) {
+    const c = genCode();
+    if (!(await env.CONAV_SESSIONS.get('s:' + c))) { code = c; break; }
+  }
+  if (!code) return json({ ok: false, error: 'Impossible de générer un code' }, 503);
+  const session = { code, hostToken: genToken(), guestToken: null, currentUrl: '',
+    events: [], hostName: 'Hôte', guestName: null, createdAt: Date.now(), lastActivity: Date.now() };
+  await saveSession(env, session);
+  return json({ ok: true, code, hostToken: session.hostToken,
+    formatted: code.substring(0, 3) + '-' + code.substring(3) });
+}
+
+async function conavJoin(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'JSON invalide' }, 400); }
+  const code = String(body.code || '').replace(/[^0-9]/g, '');
+  if (code.length !== CONAV_CODE_LENGTH) return json({ ok: false, error: 'Code invalide' }, 400);
+  const s = await loadSession(env, code);
+  if (!s) return json({ ok: false, error: 'Session introuvable ou expirée' }, 404);
+  if (s.guestToken) return json({ ok: false, error: 'Session déjà rejointe' }, 409);
+  s.guestToken = genToken();
+  s.guestName = body.name ? String(body.name).substring(0, 30) : 'Invité';
+  s.events.push({ id: 'e_' + Date.now().toString(36), type: 'guest-joined',
+    from: 'system', name: s.guestName, ts: Date.now() });
+  await saveSession(env, s);
+  return json({ ok: true, guestToken: s.guestToken, currentUrl: s.currentUrl, hostName: s.hostName });
+}
+
+async function conavPoll(request, env) {
+  const url = new URL(request.url);
+  const code = (url.searchParams.get('code') || '').replace(/[^0-9]/g, '');
+  const token = url.searchParams.get('token') || '';
+  const since = parseInt(url.searchParams.get('since') || '0', 10);
+  const s = await loadSession(env, code);
+  if (!s) return json({ ok: false, error: 'Session expirée' }, 404);
+  const role = (token === s.hostToken) ? 'host' : (token === s.guestToken) ? 'guest' : null;
+  if (!role) return json({ ok: false, error: 'Token invalide' }, 403);
+  return json({ ok: true,
+    events: (s.events || []).filter(e => e.ts > since && e.from !== role),
+    serverTs: Date.now(), currentUrl: s.currentUrl,
+    peerName: role === 'host' ? s.guestName : s.hostName,
+    peerConnected: role === 'host' ? !!s.guestToken : true });
+}
+
+async function conavSend(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'JSON invalide' }, 400); }
+  const code = String(body.code || '').replace(/[^0-9]/g, '');
+  const token = String(body.token || ''), type = String(body.type || '');
+  if (!code || !token || !type) return json({ ok: false, error: 'code/token/type requis' }, 400);
+  const s = await loadSession(env, code);
+  if (!s) return json({ ok: false, error: 'Session expirée' }, 404);
+  const role = (token === s.hostToken) ? 'host' : (token === s.guestToken) ? 'guest' : null;
+  if (!role) return json({ ok: false, error: 'Token invalide' }, 403);
+  const valid = ['message','url-change','highlight','click-request','click-result','set-name','ping','foreman'];
+  if (!valid.includes(type)) return json({ ok: false, error: 'Type invalide' }, 400);
+
+  if (type === 'click-request' || type === 'highlight') {
+    const now = Date.now(), k = '_last_' + type + '_' + role;
+    const min = type === 'click-request' ? 3000 : 1000;
+    if (now - (s[k] || 0) < min) {
+      return json({ ok: false, error: 'Trop rapide, attends ' + Math.ceil((min - (now - (s[k] || 0))) / 1000) + 's' }, 429);
+    }
+    s[k] = now;
+  }
+  if (type === 'set-name') {
+    const n = String(body.name || '').substring(0, 30);
+    if (role === 'host') s.hostName = n || 'Hôte'; else s.guestName = n || 'Invité';
+  }
+  if (type === 'url-change' && body.url && role === 'host') {
+    s.currentUrl = String(body.url).substring(0, 500);
+  }
+  const evt = { id: 'e_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+    type, from: role, ts: Date.now() };
+  ['text','url','selector','label','safeBottom','largeMode','name','ok','payload'].forEach(k => {
+    if (body[k] !== undefined) evt[k] = body[k];
+  });
+  s.events = (s.events || []).concat([evt]);
+  if (s.events.length > CONAV_MAX_EVENTS) s.events = s.events.slice(-CONAV_MAX_EVENTS);
+  await saveSession(env, s);
+  return json({ ok: true, eventId: evt.id });
+}
+
+async function conavLeave(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'JSON invalide' }, 400); }
+  const code = String(body.code || '').replace(/[^0-9]/g, '');
+  const token = String(body.token || '');
+  const s = await loadSession(env, code);
+  if (!s) return json({ ok: true });
+  const role = (token === s.hostToken) ? 'host' : (token === s.guestToken) ? 'guest' : null;
+  if (!role) return json({ ok: false, error: 'Token invalide' }, 403);
+  s.events = (s.events || []).concat([{ id: 'e_' + Date.now().toString(36),
+    type: 'peer-left', from: role, ts: Date.now() }]);
+  if (role === 'host') await env.CONAV_SESSIONS.delete('s:' + code);
+  else { s.guestToken = null; s.guestName = null; await saveSession(env, s); }
+  return json({ ok: true });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  HEARTBEAT
+// ════════════════════════════════════════════════════════════════════════
+async function heartbeatReceive(request, env) {
+  if (!env.CONAV_SESSIONS) return json({ ok: false, error: 'KV indispo' }, 503);
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'JSON invalide' }, 400); }
+
+  let events = [];
+  if (Array.isArray(body.batch)) events = body.batch.slice(0, 50);
+  else if (body.event) events = [body];
+  else return json({ ok: false, error: 'Format invalide' }, 400);
+
+  const buckets = new Map();
+  for (const evt of events) {
+    if (!evt) continue;
+    const event = String(evt.event || '').substring(0, 32).replace(/[^a-z0-9_-]/gi, '');
+    if (!event) continue;
+    const success = (evt.success === true || evt.success === false) ? evt.success : null;
+    const domain = String(evt.domain || '').substring(0, 80).replace(/[^a-z0-9.\-]/gi, '');
+    const dur = (typeof evt.duration === 'number' && evt.duration >= 0 && evt.duration < 600000)
+      ? Math.round(evt.duration) : null;
+    const day = new Date(evt.ts || Date.now()).toISOString().substring(0, 10);
+    const outcome = success === null ? 'na' : (success ? 'ok' : 'fail');
+    const key = 'hb:' + day + ':' + event + ':' + outcome;
+    if (!buckets.has(key)) buckets.set(key, { count: 0, domains: {}, durationSum: 0, durationCount: 0 });
+    const b = buckets.get(key);
+    b.count++;
+    if (domain) b.domains[domain] = (b.domains[domain] || 0) + 1;
+    if (dur !== null) { b.durationSum += dur; b.durationCount++; }
+  }
+  for (const [key, agg] of buckets) {
+    try {
+      const cur = await env.CONAV_SESSIONS.get(key);
+      const a = cur ? JSON.parse(cur) : { count: 0, domains: {}, durationSum: 0, durationCount: 0 };
+      a.count += agg.count;
+      for (const [d, c] of Object.entries(agg.domains)) a.domains[d] = (a.domains[d] || 0) + c;
+      a.durationSum += agg.durationSum; a.durationCount += agg.durationCount;
+      const dk = Object.keys(a.domains);
+      if (dk.length > 100) {
+        const top = dk.sort((x, y) => a.domains[y] - a.domains[x]).slice(0, 50);
+        const t = {}; top.forEach(k => t[k] = a.domains[k]); a.domains = t;
+      }
+      await env.CONAV_SESSIONS.put(key, JSON.stringify(a), { expirationTtl: 7 * 86400 });
+    } catch (e) {}
+  }
+  return json({ ok: true, processed: events.length, buckets: buckets.size });
+}
+
+async function heartbeatStats(env) {
+  if (!env.CONAV_SESSIONS) return json({ ok: false, error: 'KV indispo' }, 503);
+  try {
+    const cached = await env.CONAV_SESSIONS.get('hb:stats:daily:latest');
+    if (cached) {
+      const d = JSON.parse(cached);
+      return json({ ok: true, stats: d.stats, generated: d.generated, cached: true });
+    }
+    const r = await rebuildHeartbeatAggregate(env);
+    return json({ ok: true, stats: r.stats, generated: r.generated, cached: false });
+  } catch (e) {
+    return json({ ok: false, error: e.message }, 500);
+  }
+}
+
+async function rebuildHeartbeatAggregate(env) {
+  const list = await env.CONAV_SESSIONS.list({ prefix: 'hb:', limit: 1000 });
+  const stats = {};
+  for (const k of list.keys) {
+    if (k.name.startsWith('hb:stats:')) continue;
+    const v = await env.CONAV_SESSIONS.get(k.name);
+    if (!v) continue;
+    const p = k.name.split(':');
+    if (p.length !== 4) continue;
+    const [, day, event, outcome] = p;
+    stats[day] = stats[day] || {};
+    stats[day][event] = stats[day][event] || { ok: 0, fail: 0, na: 0, durationAvgMs: null, topDomains: {} };
+    try {
+      const a = JSON.parse(v);
+      stats[day][event][outcome] = a.count;
+      if (a.durationCount > 0) stats[day][event].durationAvgMs = Math.round(a.durationSum / a.durationCount);
+      for (const [d, c] of Object.entries(a.domains || {})) {
+        stats[day][event].topDomains[d] = (stats[day][event].topDomains[d] || 0) + c;
+      }
+    } catch (e) {}
+  }
+  const result = { stats, generated: new Date().toISOString() };
+  await env.CONAV_SESSIONS.put('hb:stats:daily:latest', JSON.stringify(result), { expirationTtl: 86400 * 8 });
+  return result;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  UTILS
+// ════════════════════════════════════════════════════════════════════════
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status, headers: { 'Content-Type': 'application/json', ...cors() }
+  });
+}
+
+function cors() {
+  return {
+    'Access-Control-Allow-Origin':  '*',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-App-Auth, X-Astrid-Ext, X-Astrid-Auth'
+  };
+}
